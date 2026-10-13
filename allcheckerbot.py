@@ -53,9 +53,9 @@ log = logging.getLogger("main_bot")
 
 BOT_TOKEN  = "8705914855:AAF8xGJtX-jgamaCW6VsmALD1jTVSWcL8ZQ"
 ADMIN_IDS  = [1878272964]
-WATERMARK  = "– Checked By @IPTVLinkschat"
+WATERMARK  = "– Checked By @IPTVLinksChat"
 
-FREE_COOKIE_LIMIT    = 50      # max cookies per check for free users
+FREE_COOKIE_LIMIT    = 50
 CONNECT_TIMEOUT      = 30.0
 READ_TIMEOUT         = 30.0
 WRITE_TIMEOUT        = 30.0
@@ -72,7 +72,7 @@ CHECKER_CHATGPT  = "chatgpt"
 CHECKER_CLAUDE   = "claude"
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DATABASE  (SQLite, thread-safe via lock)
+#  DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 
 _db_lock = asyncio.Lock()
@@ -94,9 +94,9 @@ def db_init():
         );
         CREATE TABLE IF NOT EXISTS subscriptions (
             uid         INTEGER PRIMARY KEY,
-            tier        TEXT DEFAULT 'free',   -- 'free' | 'premium'
-            expires_at  TEXT,                  -- NULL = never (lifetime)
-            given_by    INTEGER,               -- admin uid who granted
+            tier        TEXT DEFAULT 'free',
+            expires_at  TEXT,
+            given_by    INTEGER,
             given_at    TEXT DEFAULT (datetime('now'))
         );
         CREATE TABLE IF NOT EXISTS check_log (
@@ -110,7 +110,7 @@ def db_init():
     conn.commit()
     conn.close()
 
-# ── sync helpers (called inside run_in_executor) ──────────────────────────────
+# ── sync helpers ──────────────────────────────────────────────────────────────
 
 def _db_upsert_user(uid: int, username: str, first_name: str):
     conn = _db_connect()
@@ -125,19 +125,19 @@ def _db_upsert_user(uid: int, username: str, first_name: str):
     conn.close()
 
 def _db_get_sub(uid: int) -> Optional[sqlite3.Row]:
-    conn  = _db_connect()
-    row   = conn.execute("SELECT * FROM subscriptions WHERE uid=?", (uid,)).fetchone()
+    conn = _db_connect()
+    row  = conn.execute("SELECT * FROM subscriptions WHERE uid=?", (uid,)).fetchone()
     conn.close()
     return row
 
 def _db_set_premium(uid: int, days: Optional[int], given_by: int):
-    """days=None → lifetime premium"""
     expires = None if days is None else (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     conn = _db_connect()
     conn.execute("""
         INSERT INTO subscriptions (uid, tier, expires_at, given_by)
         VALUES (?,?,?,?)
-        ON CONFLICT(uid) DO UPDATE SET tier='premium', expires_at=excluded.expires_at, given_by=excluded.given_by, given_at=datetime('now')
+        ON CONFLICT(uid) DO UPDATE SET tier='premium', expires_at=excluded.expires_at,
+        given_by=excluded.given_by, given_at=datetime('now')
     """, (uid, "premium", expires, given_by))
     conn.commit()
     conn.close()
@@ -155,8 +155,8 @@ def _db_log_check(uid: int, checker: str, cnt: int):
     conn.close()
 
 def _db_all_users() -> list:
-    conn  = _db_connect()
-    rows  = conn.execute("""
+    conn = _db_connect()
+    rows = conn.execute("""
         SELECT u.uid, u.username, u.first_name, s.tier, s.expires_at
         FROM users u LEFT JOIN subscriptions s ON u.uid=s.uid
         ORDER BY s.tier DESC, u.joined_at DESC
@@ -166,7 +166,7 @@ def _db_all_users() -> list:
     return rows
 
 def _db_stats() -> dict:
-    conn = _db_connect()
+    conn    = _db_connect()
     total   = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     premium = conn.execute("SELECT COUNT(*) FROM subscriptions WHERE tier='premium'").fetchone()[0]
     checks  = conn.execute("SELECT COUNT(*), SUM(cookies_cnt) FROM check_log").fetchone()
@@ -174,40 +174,37 @@ def _db_stats() -> dict:
     return {"total": total, "premium": premium,
             "checks": checks[0] or 0, "cookies": checks[1] or 0}
 
-# ── async wrappers ─────────────────────────────────────────────────────────────
+# ── async wrappers (using get_running_loop — Python 3.14 compatible) ──────────
 
 async def db_upsert_user(uid: int, username: str, first_name: str):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _db_upsert_user, uid, username, first_name)
 
 async def db_get_tier(uid: int) -> str:
-    """Returns 'admin' | 'premium' | 'free'"""
     if uid in ADMIN_IDS:
         return "admin"
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     row  = await loop.run_in_executor(None, _db_get_sub, uid)
     if not row or row["tier"] == "free":
         return "free"
-    # check expiry
     if row["expires_at"]:
         exp = datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S")
         if datetime.utcnow() > exp:
-            # auto-downgrade
-            await asyncio.get_event_loop().run_in_executor(None, _db_remove_premium, uid)
+            await loop.run_in_executor(None, _db_remove_premium, uid)
             return "free"
     return "premium"
 
 async def db_set_premium(uid: int, days: Optional[int], given_by: int):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _db_set_premium, uid, days, given_by)
-    await db_upsert_user(uid, "", "")   # ensure user row exists
+    await db_upsert_user(uid, "", "")
 
 async def db_remove_premium(uid: int):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _db_remove_premium, uid)
 
 async def db_log_check(uid: int, checker: str, cnt: int):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _db_log_check, uid, checker, cnt)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -218,7 +215,6 @@ def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
 async def get_limit(uid: int) -> Optional[int]:
-    """None = unlimited"""
     tier = await db_get_tier(uid)
     if tier in ("admin", "premium"):
         return None
@@ -775,7 +771,8 @@ async def run_prime(cookie_files, msg, cancel):
         report.append(f"[FILE] {fname} — {len(accs)} account(s)")
     live_entries=[]; dead_entries=[]
     stats={"total":total,"alive":0,"dead":0,"dup":0,"paid":0,"free":0,"checked":0}
-    known_ubids=set(); loop=asyncio.get_event_loop()
+    known_ubids=set()
+    loop = asyncio.get_running_loop()
     for a in all_accs:
         if cancel.is_set(): break
         cd   = pv_parse(a["raw"])
@@ -1042,13 +1039,11 @@ async def show_main_menu(target, edit=False):
     elif hasattr(target,"message") and target.message:
         await target.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
 
-# ── /start ────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     await db_upsert_user(u.id, u.username or "", u.first_name or "")
     await show_main_menu(update.message)
 
-# ── /addpremium <uid> [days] ──────────────────────────────────────────────────
 async def cmd_addpremium(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only.")
@@ -1073,7 +1068,6 @@ async def cmd_addpremium(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"UID     : <code>{target_uid}</code>\n"
         f"Expires : <code>{expiry_str}</code>",
         parse_mode=ParseMode.HTML)
-    # notify target user if possible
     try:
         await ctx.bot.send_message(
             chat_id=target_uid,
@@ -1085,7 +1079,6 @@ async def cmd_addpremium(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# ── /removepremium <uid> ──────────────────────────────────────────────────────
 async def cmd_removepremium(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only.")
@@ -1100,13 +1093,12 @@ async def cmd_removepremium(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ Premium removed for <code>{target_uid}</code>", parse_mode=ParseMode.HTML)
 
-# ── /mystatus ─────────────────────────────────────────────────────────────────
 async def cmd_mystatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u    = update.effective_user
     await db_upsert_user(u.id, u.username or "", u.first_name or "")
     tier = await db_get_tier(u.id)
     badge= tier_badge(tier)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     row  = await loop.run_in_executor(None, _db_get_sub, u.id)
     exp  = row["expires_at"] if row else None
     limit_str = f"<code>{FREE_COOKIE_LIMIT}</code> per check" if tier=="free" else "Unlimited ✨"
@@ -1119,12 +1111,11 @@ async def cmd_mystatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Expiry : <code>{exp_str}</code>",
         parse_mode=ParseMode.HTML, reply_markup=back_kb())
 
-# ── /users  (admin) ───────────────────────────────────────────────────────────
 async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only.")
         return
-    loop  = asyncio.get_event_loop()
+    loop  = asyncio.get_running_loop()
     rows  = await loop.run_in_executor(None, _db_all_users)
     stats = await loop.run_in_executor(None, _db_stats)
     lines = [
@@ -1142,7 +1133,6 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{badge} <code>{r['uid']}</code> — {uname}{exp}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
-# ── /broadcast <msg>  (admin) ─────────────────────────────────────────────────
 async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admin only.")
@@ -1151,7 +1141,7 @@ async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /broadcast <message>")
         return
     text  = " ".join(ctx.args)
-    loop  = asyncio.get_event_loop()
+    loop  = asyncio.get_running_loop()
     rows  = await loop.run_in_executor(None, _db_all_users)
     ok = fail = 0
     for r in rows:
@@ -1163,7 +1153,6 @@ async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(0.05)
     await update.message.reply_text(f"📢 Broadcast done\n✅ {ok}  ❌ {fail}")
 
-# ── callback query ─────────────────────────────────────────────────────────────
 async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q: CallbackQuery = update.callback_query
     await q.answer()
@@ -1208,7 +1197,6 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📤 Ab apna <code>.txt</code> ya <code>.zip</code> file bhejo.",
             parse_mode=ParseMode.HTML, reply_markup=back_kb())
 
-# ── document handler ───────────────────────────────────────────────────────────
 async def file_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc: return
@@ -1228,10 +1216,9 @@ async def file_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML, reply_markup=back_kb())
         return
 
-    # register user
     await db_upsert_user(u.id, u.username or "", u.first_name or "")
     tier  = await db_get_tier(u.id)
-    limit = await get_limit(u.id)   # None = unlimited
+    limit = await get_limit(u.id)
 
     msg = await update.message.reply_text("⏬ Downloading...")
     raw = await download_file(ctx.bot, doc)
@@ -1248,7 +1235,6 @@ async def file_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         content      = raw.decode("utf-8", errors="ignore")
         cookie_files = [(fname, content)]
 
-    # ── apply limit ──────────────────────────────────────────────────────────
     original_count = len(cookie_files)
     if limit is not None and original_count > limit:
         cookie_files = cookie_files[:limit]
@@ -1362,7 +1348,7 @@ async def file_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_kb())
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MAIN
+#  MAIN  —  PTB manages its own event loop, never wrap in asyncio.run()
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
@@ -1377,22 +1363,25 @@ def main():
 
     req = HTTPXRequest(
         connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT,
-        write_timeout=WRITE_TIMEOUT, pool_timeout=POOL_TIMEOUT,
+        write_timeout=WRITE_TIMEOUT,     pool_timeout=POOL_TIMEOUT,
     )
-    app = (Application.builder().token(BOT_TOKEN).request(req)
-           .concurrent_updates(True).build())
+    app = (Application.builder()
+           .token(BOT_TOKEN)
+           .request(req)
+           .concurrent_updates(True)
+           .build())
 
-    app.add_handler(CommandHandler("start",          cmd_start))
-    app.add_handler(CommandHandler("addpremium",     cmd_addpremium))
-    app.add_handler(CommandHandler("removepremium",  cmd_removepremium))
-    app.add_handler(CommandHandler("mystatus",       cmd_mystatus))
-    app.add_handler(CommandHandler("users",          cmd_users))
-    app.add_handler(CommandHandler("broadcast",      cmd_broadcast))
+    app.add_handler(CommandHandler("start",         cmd_start))
+    app.add_handler(CommandHandler("addpremium",    cmd_addpremium))
+    app.add_handler(CommandHandler("removepremium", cmd_removepremium))
+    app.add_handler(CommandHandler("mystatus",      cmd_mystatus))
+    app.add_handler(CommandHandler("users",         cmd_users))
+    app.add_handler(CommandHandler("broadcast",     cmd_broadcast))
     app.add_handler(CallbackQueryHandler(cb_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
 
     log.info("Bot started.")
-    # ✅ Direct call, no asyncio.run()
+    # PTB's run_polling() calls asyncio.run() internally — never nest it
     app.run_polling(drop_pending_updates=True)
 
 
