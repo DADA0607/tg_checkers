@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
-for pkg in ("telegram", "aiohttp", "curl_cffi", "requests", "aiofiles", "urllib3"):
+for pkg in ("telegram", "aiohttp", "curl_cffi", "requests", "aiofiles", "urllib3", "rarfile"):
     try:
         __import__(pkg)
     except ImportError:
@@ -30,6 +30,7 @@ for pkg in ("telegram", "aiohttp", "curl_cffi", "requests", "aiofiles", "urllib3
         sys.exit(1)
 
 import aiohttp
+import rarfile
 import requests
 import urllib3
 from curl_cffi.requests import AsyncSession
@@ -65,11 +66,12 @@ DB_PATH              = "bot_users.db"
 KEY_ACTIVE_CHECKER = "active_checker"
 KEY_CANCEL_EVENT   = "cancel_event"
 
-CHECKER_NFBULK   = "nfbulk"
-CHECKER_NFTOKEN  = "nftoken"
-CHECKER_PRIME    = "prime"
-CHECKER_CHATGPT  = "chatgpt"
-CHECKER_CLAUDE   = "claude"
+CHECKER_NFBULK    = "nfbulk"
+CHECKER_NFTOKEN   = "nftoken"
+CHECKER_PRIME     = "prime"
+CHECKER_CHATGPT   = "chatgpt"
+CHECKER_CLAUDE    = "claude"
+CHECKER_NFEXTRACT = "nfextract"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DATABASE
@@ -110,8 +112,6 @@ def db_init():
     conn.commit()
     conn.close()
 
-# ── sync helpers ──────────────────────────────────────────────────────────────
-
 def _db_upsert_user(uid: int, username: str, first_name: str):
     conn = _db_connect()
     conn.execute("""
@@ -136,8 +136,7 @@ def _db_set_premium(uid: int, days: Optional[int], given_by: int):
     conn.execute("""
         INSERT INTO subscriptions (uid, tier, expires_at, given_by)
         VALUES (?,?,?,?)
-        ON CONFLICT(uid) DO UPDATE SET tier='premium', expires_at=excluded.expires_at,
-        given_by=excluded.given_by, given_at=datetime('now')
+        ON CONFLICT(uid) DO UPDATE SET tier='premium', expires_at=excluded.expires_at, given_by=excluded.given_by, given_at=datetime('now')
     """, (uid, "premium", expires, given_by))
     conn.commit()
     conn.close()
@@ -166,7 +165,7 @@ def _db_all_users() -> list:
     return rows
 
 def _db_stats() -> dict:
-    conn    = _db_connect()
+    conn  = _db_connect()
     total   = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     premium = conn.execute("SELECT COUNT(*) FROM subscriptions WHERE tier='premium'").fetchone()[0]
     checks  = conn.execute("SELECT COUNT(*), SUM(cookies_cnt) FROM check_log").fetchone()
@@ -174,38 +173,33 @@ def _db_stats() -> dict:
     return {"total": total, "premium": premium,
             "checks": checks[0] or 0, "cookies": checks[1] or 0}
 
-# ── async wrappers (using get_running_loop — Python 3.14 compatible) ──────────
+# ── async wrappers ─────────────────────────────────────────────────────────────
 
 async def db_upsert_user(uid: int, username: str, first_name: str):
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _db_upsert_user, uid, username, first_name)
+    await asyncio.get_running_loop().run_in_executor(None, _db_upsert_user, uid, username, first_name)
 
 async def db_get_tier(uid: int) -> str:
     if uid in ADMIN_IDS:
         return "admin"
-    loop = asyncio.get_running_loop()
-    row  = await loop.run_in_executor(None, _db_get_sub, uid)
+    row = await asyncio.get_running_loop().run_in_executor(None, _db_get_sub, uid)
     if not row or row["tier"] == "free":
         return "free"
     if row["expires_at"]:
         exp = datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S")
         if datetime.utcnow() > exp:
-            await loop.run_in_executor(None, _db_remove_premium, uid)
+            await asyncio.get_running_loop().run_in_executor(None, _db_remove_premium, uid)
             return "free"
     return "premium"
 
 async def db_set_premium(uid: int, days: Optional[int], given_by: int):
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _db_set_premium, uid, days, given_by)
+    await asyncio.get_running_loop().run_in_executor(None, _db_set_premium, uid, days, given_by)
     await db_upsert_user(uid, "", "")
 
 async def db_remove_premium(uid: int):
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _db_remove_premium, uid)
+    await asyncio.get_running_loop().run_in_executor(None, _db_remove_premium, uid)
 
 async def db_log_check(uid: int, checker: str, cnt: int):
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _db_log_check, uid, checker, cnt)
+    await asyncio.get_running_loop().run_in_executor(None, _db_log_check, uid, checker, cnt)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ACCESS CONTROL
@@ -241,6 +235,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🤖 ChatGPT Checker",         callback_data=f"run_{CHECKER_CHATGPT}")],
         [InlineKeyboardButton("🧠 Claude Checker",          callback_data=f"run_{CHECKER_CLAUDE}")],
         [InlineKeyboardButton("🔑 NF Token Checker",        callback_data=f"run_{CHECKER_NFTOKEN}")],
+        [InlineKeyboardButton("🎯 NF Cookie Extractor",     callback_data=f"run_{CHECKER_NFEXTRACT}")],
         [InlineKeyboardButton("🛑 Stop Checker",            callback_data="stop_checker")],
     ])
 
@@ -323,6 +318,7 @@ def safe_unquote(v: str) -> str:
 
 def extract_zip_txts(raw: bytes) -> List[Tuple[str, str]]:
     out = []
+    # try ZIP first
     try:
         with zipfile.ZipFile(BytesIO(raw)) as zf:
             for name in zf.namelist():
@@ -336,7 +332,25 @@ def extract_zip_txts(raw: bytes) -> List[Tuple[str, str]]:
                             out.append((os.path.basename(name), content))
                     except Exception:
                         pass
+        return out
     except zipfile.BadZipFile:
+        pass
+    # try RAR
+    try:
+        tmp = BytesIO(raw)
+        with rarfile.RarFile(tmp) as rf:
+            for name in rf.namelist():
+                if name.endswith("/"):
+                    continue
+                lower = name.lower()
+                if lower.endswith((".txt", ".cookies")) or "." not in os.path.basename(name):
+                    try:
+                        content = rf.read(name).decode("utf-8", errors="ignore")
+                        if content.strip():
+                            out.append((os.path.basename(name), content))
+                    except Exception:
+                        pass
+    except Exception:
         pass
     return out
 
@@ -771,8 +785,7 @@ async def run_prime(cookie_files, msg, cancel):
         report.append(f"[FILE] {fname} — {len(accs)} account(s)")
     live_entries=[]; dead_entries=[]
     stats={"total":total,"alive":0,"dead":0,"dup":0,"paid":0,"free":0,"checked":0}
-    known_ubids=set()
-    loop = asyncio.get_running_loop()
+    known_ubids=set(); loop=asyncio.get_running_loop()
     for a in all_accs:
         if cancel.is_set(): break
         cd   = pv_parse(a["raw"])
@@ -1020,6 +1033,43 @@ async def run_claude(cookie_files, msg, cancel):
     return buf, {"total":total,"premium":len(premium),"free":len(free_list),"dead":dead}
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  CHECKER 6 — NF COOKIE EXTRACTOR
+#  Sirf NetflixId= lines extract karo, no validation — fast bulk extraction
+# ══════════════════════════════════════════════════════════════════════════════
+
+_NF_ID_RE = re.compile(r"\bNetflixId=[^\s\t\r\n]+")
+
+def nfextract_from_text(content: str) -> List[str]:
+    return _NF_ID_RE.findall(content)
+
+async def run_nfextract(cookie_files, msg, cancel) -> Tuple[BytesIO, int]:
+    total   = len(cookie_files)
+    all_ids: List[str] = []
+    done    = 0
+
+    for fname, content in cookie_files:
+        if cancel.is_set():
+            break
+        ids = nfextract_from_text(content)
+        all_ids.extend(ids)
+        done += 1
+        if done % 10 == 0 or done == total:
+            try:
+                await msg.edit_text(
+                    f"🎯 <b>NF Extractor...</b>\n{make_bar(done, total)}\n"
+                    f"📦 {done}/{total}  🍪 Found: <code>{len(all_ids)}</code>",
+                    parse_mode=ParseMode.HTML, reply_markup=back_stop_kb())
+            except Exception:
+                pass
+
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for idx, cookie in enumerate(all_ids, start=1):
+            zf.writestr(f"cookie_{idx}.txt", cookie + "\n")
+    buf.seek(0)
+    return buf, len(all_ids)
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  TELEGRAM HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1186,16 +1236,23 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         names = {
             CHECKER_NFBULK:"🎬 Netflix Bulk", CHECKER_NFTOKEN:"🔑 NF Token",
             CHECKER_PRIME:"🎥 Prime Video", CHECKER_CHATGPT:"🤖 ChatGPT",
-            CHECKER_CLAUDE:"🧠 Claude",
+            CHECKER_CLAUDE:"🧠 Claude", CHECKER_NFEXTRACT:"🎯 NF Cookie Extractor",
         }
         tier  = await db_get_tier(u.id)
-        limit = FREE_COOKIE_LIMIT if tier=="free" else "Unlimited"
-        await q.message.edit_text(
-            f"<b>{names.get(checker,checker)} Checker</b>\n\n"
-            f"Plan  : {tier_badge(tier)}\n"
-            f"Limit : <code>{limit}</code> cookies/check\n\n"
-            f"📤 Ab apna <code>.txt</code> ya <code>.zip</code> file bhejo.",
-            parse_mode=ParseMode.HTML, reply_markup=back_kb())
+        if checker == CHECKER_NFEXTRACT:
+            await q.message.edit_text(
+                f"<b>🎯 NF Cookie Extractor</b>\n\n"
+                f"Sirf NetflixId extract karta hai — no validation, super fast.\n\n"
+                f"📤 Ab apna <code>.txt</code>, <code>.zip</code> ya <code>.rar</code> file bhejo.",
+                parse_mode=ParseMode.HTML, reply_markup=back_kb())
+        else:
+            limit = FREE_COOKIE_LIMIT if tier=="free" else "Unlimited"
+            await q.message.edit_text(
+                f"<b>{names.get(checker,checker)} Checker</b>\n\n"
+                f"Plan  : {tier_badge(tier)}\n"
+                f"Limit : <code>{limit}</code> cookies/check\n\n"
+                f"📤 Ab apna <code>.txt</code>, <code>.zip</code> ya <code>.rar</code> file bhejo.",
+                parse_mode=ParseMode.HTML, reply_markup=back_kb())
 
 async def file_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
@@ -1210,9 +1267,9 @@ async def file_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     fname = doc.file_name or ""
     ext   = os.path.splitext(fname)[1].lower()
-    if ext not in (".txt",".zip"):
+    if ext not in (".txt",".zip",".rar"):
         await update.message.reply_text(
-            "❌ Only <code>.txt</code> or <code>.zip</code> supported.",
+            "❌ Only <code>.txt</code>, <code>.zip</code> or <code>.rar</code> supported.",
             parse_mode=ParseMode.HTML, reply_markup=back_kb())
         return
 
@@ -1226,17 +1283,18 @@ async def file_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("❌ Download failed.", reply_markup=back_kb())
         return
 
-    if ext == ".zip":
+    if ext in (".zip", ".rar"):
         cookie_files = extract_zip_txts(raw)
         if not cookie_files:
-            await msg.edit_text("❌ ZIP mein koi readable .txt nahi mili.", reply_markup=back_kb())
+            await msg.edit_text("❌ Archive mein koi readable .txt nahi mili.", reply_markup=back_kb())
             return
     else:
         content      = raw.decode("utf-8", errors="ignore")
         cookie_files = [(fname, content)]
 
     original_count = len(cookie_files)
-    if limit is not None and original_count > limit:
+    # nfextract is just extraction — no checking, no limit
+    if checker != CHECKER_NFEXTRACT and limit is not None and original_count > limit:
         cookie_files = cookie_files[:limit]
         await update.message.reply_text(
             f"⚠️ <b>Limit reached!</b>\n\n"
@@ -1342,17 +1400,34 @@ async def file_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     filename=f"claude_{ts}.zip",
                     caption=f"🧠 Claude — {stats['premium']} pro, {stats['free']} free")
 
+        elif checker == CHECKER_NFEXTRACT:
+            await msg.edit_text(
+                f"🎯 <b>NF Cookie Extractor</b> — {len(cookie_files)} files processing...",
+                parse_mode=ParseMode.HTML, reply_markup=back_stop_kb())
+            zip_buf, found = await run_nfextract(cookie_files, msg, cancel)
+            await db_log_check(u.id, checker, len(cookie_files))
+            summary = (
+                f"{'🛑 Stopped' if cancel.is_set() else '✅ Done'} — <b>NF Cookie Extractor</b>\n\n"
+                f"📦 Files  : <code>{len(cookie_files)}</code>\n"
+                f"🍪 Extracted : <code>{found}</code> NetflixId cookies"
+            )
+            await msg.edit_text(summary, parse_mode=ParseMode.HTML, reply_markup=back_kb())
+            if found:
+                await update.message.reply_document(document=zip_buf,
+                    filename=f"nf_extracted_{ts}.zip",
+                    caption=f"🎯 NF Extractor — {found} cookies")
+
     except Exception as e:
         log.exception(f"Checker {checker} crashed: {e}")
         await msg.edit_text(f"❌ Error: <code>{e}</code>", parse_mode=ParseMode.HTML,
             reply_markup=back_kb())
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MAIN  —  PTB manages its own event loop, never wrap in asyncio.run()
+#  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+    if BOT_TOKEN == "token":
         print("[ERROR] BOT_TOKEN set karo pehle!")
         sys.exit(1)
 
@@ -1363,27 +1438,22 @@ def main():
 
     req = HTTPXRequest(
         connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT,
-        write_timeout=WRITE_TIMEOUT,     pool_timeout=POOL_TIMEOUT,
+        write_timeout=WRITE_TIMEOUT, pool_timeout=POOL_TIMEOUT,
     )
-    app = (Application.builder()
-           .token(BOT_TOKEN)
-           .request(req)
-           .concurrent_updates(True)
-           .build())
+    app = (Application.builder().token(BOT_TOKEN).request(req)
+           .concurrent_updates(True).build())
 
-    app.add_handler(CommandHandler("start",         cmd_start))
-    app.add_handler(CommandHandler("addpremium",    cmd_addpremium))
-    app.add_handler(CommandHandler("removepremium", cmd_removepremium))
-    app.add_handler(CommandHandler("mystatus",      cmd_mystatus))
-    app.add_handler(CommandHandler("users",         cmd_users))
-    app.add_handler(CommandHandler("broadcast",     cmd_broadcast))
+    app.add_handler(CommandHandler("start",          cmd_start))
+    app.add_handler(CommandHandler("addpremium",     cmd_addpremium))
+    app.add_handler(CommandHandler("removepremium",  cmd_removepremium))
+    app.add_handler(CommandHandler("mystatus",       cmd_mystatus))
+    app.add_handler(CommandHandler("users",          cmd_users))
+    app.add_handler(CommandHandler("broadcast",      cmd_broadcast))
     app.add_handler(CallbackQueryHandler(cb_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
 
     log.info("Bot started.")
-    # PTB's run_polling() calls asyncio.run() internally — never nest it
-    app.run_polling(drop_pending_updates=True)
-
+    asyncio.run(app.run_polling(drop_pending_updates=True))
 
 if __name__ == "__main__":
     main()
