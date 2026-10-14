@@ -1,11 +1,10 @@
 services:
-  - type: web
+  - type: worker
     name: allcheckerbot
-    env: python
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python allcheckerbot.py"
-    autoDeploy: true
+    runtime: python
+    buildCommand: |
+      apt-get update && apt-get install -y unrar-free && pip install python-telegram-bot aiohttp curl_cffi requests aiofiles urllib3 rarfile
+    startCommand: python allcheckerbot.py
     envVars:
-      - key: BOT_TOKEN
-        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11"
