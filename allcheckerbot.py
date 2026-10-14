@@ -1453,7 +1453,10 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
 
     log.info("Bot started.")
-    asyncio.run(app.run_polling(drop_pending_updates=True))
+    # ✅ Direct call, no asyncio.run()
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
+
